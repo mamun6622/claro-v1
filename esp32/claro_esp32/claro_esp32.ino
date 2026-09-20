@@ -4,335 +4,650 @@
 #include "ESP_I2S.h"
 
 // ============================================================
-// CLARO V1
-// ESP32-S3 + INMP441 + MAX98357A
+// CLARO V1 - ESP32-S3
+// Voice Activity Detection Recording
 // ============================================================
 
-// ---------------- WIFI ----------------
+// -----------------------------
+// Wi-Fi
+// -----------------------------
 
 const char* WIFI_SSID = "U+Net2DD0";
 const char* WIFI_PASSWORD = "8CD#B9BHB8";
 
-// ---------------- BACKEND ----------------
+// PC backend
+const char* BACKEND_URL = "http://192.168.219.101:8001";
 
-const char* BACKEND_URL =
-    "http://192.168.219.101:8001";
+// ============================================================
+// I2S MICROPHONE - INMP441
+// ============================================================
 
-// ---------------- I2S PINS ----------------
-
-// INMP441
 #define MIC_BCLK 4
 #define MIC_WS   5
-#define MIC_DATA 6
+#define MIC_SD   6
 
-// MAX98357A
+// ============================================================
+// I2S SPEAKER - MAX98357A
+// ============================================================
+
 #define SPK_BCLK 4
-#define SPK_WS   5
-#define SPK_DATA 18
+#define SPK_LRC  5
+#define SPK_DOUT 18
 
-// ---------------- AUDIO ----------------
+// ============================================================
+// AUDIO SETTINGS
+// ============================================================
 
 #define SAMPLE_RATE 16000
-#define RECORD_SECONDS 5
+#define RECORD_SAMPLE_RATE 16000
+
+// Maximum recording time
+#define MAX_RECORD_SECONDS 15
+#define MAX_SAMPLES (SAMPLE_RATE * MAX_RECORD_SECONDS)
+
+// Silence required before stopping
+#define SILENCE_DURATION_MS 500
+
+// Time required for audio level to be above threshold
+// before considering it speech
+#define SPEECH_CONFIRM_MS 120
+
+// Number of samples used for level detection
+#define LEVEL_CHUNK_SAMPLES 256
+
+// ============================================================
+// VOICE DETECTION SETTINGS
+// ============================================================
+
+// Adjust this if needed after testing.
+//
+// Higher = less sensitive
+// Lower  = more sensitive
+//
+// Start with 900.
+#define SPEECH_THRESHOLD 700
+
+// ============================================================
+// I2S OBJECT
+// ============================================================
 
 I2SClass I2S;
-
-
-// ============================================================
-// INITIALIZE MICROPHONE
-// ============================================================
-
-bool startMicrophone()
-{
-    Serial.println();
-    Serial.println("Starting microphone I2S...");
-
-    // Make sure previous I2S session is stopped
-    I2S.end();
-
-    delay(100);
-
-    // Input only
-    I2S.setPins(
-        MIC_BCLK,
-        MIC_WS,
-        -1,
-        MIC_DATA
-    );
-
-    bool ok = I2S.begin(
-        I2S_MODE_STD,
-        SAMPLE_RATE,
-        I2S_DATA_BIT_WIDTH_32BIT,
-        I2S_SLOT_MODE_MONO,
-        I2S_STD_SLOT_LEFT
-    );
-
-    if (!ok)
-    {
-        Serial.println("ERROR: I2S microphone begin failed.");
-        return false;
-    }
-
-    Serial.println("Microphone I2S initialized.");
-
-    // Give DMA some time to start filling
-    delay(100);
-
-    return true;
-}
-
 
 // ============================================================
 // WAV HEADER
 // ============================================================
 
 void writeWavHeader(
-    uint8_t* header,
-    uint32_t dataSize
-)
-{
+    uint8_t* buffer,
+    uint32_t dataSize,
+    uint32_t sampleRate
+) {
+
     uint32_t fileSize = dataSize + 36;
 
-    uint16_t audioFormat = 1;
-    uint16_t channels = 1;
-    uint32_t sampleRate = SAMPLE_RATE;
-    uint16_t bitsPerSample = 16;
+    // RIFF
+    buffer[0] = 'R';
+    buffer[1] = 'I';
+    buffer[2] = 'F';
+    buffer[3] = 'F';
 
-    uint32_t byteRate =
-        sampleRate *
-        channels *
-        bitsPerSample / 8;
+    buffer[4] = fileSize & 0xFF;
+    buffer[5] = (fileSize >> 8) & 0xFF;
+    buffer[6] = (fileSize >> 16) & 0xFF;
+    buffer[7] = (fileSize >> 24) & 0xFF;
 
-    uint16_t blockAlign =
-        channels *
-        bitsPerSample / 8;
+    // WAVE
+    buffer[8] = 'W';
+    buffer[9] = 'A';
+    buffer[10] = 'V';
+    buffer[11] = 'E';
 
-    memcpy(header, "RIFF", 4);
+    // fmt
+    buffer[12] = 'f';
+    buffer[13] = 'm';
+    buffer[14] = 't';
+    buffer[15] = ' ';
 
-    header[4] = fileSize & 0xFF;
-    header[5] = (fileSize >> 8) & 0xFF;
-    header[6] = (fileSize >> 16) & 0xFF;
-    header[7] = (fileSize >> 24) & 0xFF;
+    // PCM chunk size
+    buffer[16] = 16;
+    buffer[17] = 0;
+    buffer[18] = 0;
+    buffer[19] = 0;
 
-    memcpy(header + 8, "WAVE", 4);
+    // PCM format = 1
+    buffer[20] = 1;
+    buffer[21] = 0;
 
-    memcpy(header + 12, "fmt ", 4);
+    // Mono
+    buffer[22] = 1;
+    buffer[23] = 0;
 
-    header[16] = 16;
-    header[17] = 0;
-    header[18] = 0;
-    header[19] = 0;
+    // Sample rate
+    buffer[24] = sampleRate & 0xFF;
+    buffer[25] = (sampleRate >> 8) & 0xFF;
+    buffer[26] = (sampleRate >> 16) & 0xFF;
+    buffer[27] = (sampleRate >> 24) & 0xFF;
 
-    header[20] = audioFormat;
-    header[21] = 0;
+    // Byte rate
+    uint32_t byteRate = sampleRate * 2;
 
-    header[22] = channels;
-    header[23] = 0;
+    buffer[28] = byteRate & 0xFF;
+    buffer[29] = (byteRate >> 8) & 0xFF;
+    buffer[30] = (byteRate >> 16) & 0xFF;
+    buffer[31] = (byteRate >> 24) & 0xFF;
 
-    header[24] = sampleRate & 0xFF;
-    header[25] = (sampleRate >> 8) & 0xFF;
-    header[26] = (sampleRate >> 16) & 0xFF;
-    header[27] = (sampleRate >> 24) & 0xFF;
+    // Block align
+    buffer[32] = 2;
+    buffer[33] = 0;
 
-    header[28] = byteRate & 0xFF;
-    header[29] = (byteRate >> 8) & 0xFF;
-    header[30] = (byteRate >> 16) & 0xFF;
-    header[31] = (byteRate >> 24) & 0xFF;
+    // Bits per sample
+    buffer[34] = 16;
+    buffer[35] = 0;
 
-    header[32] = blockAlign;
-    header[33] = 0;
+    // data
+    buffer[36] = 'd';
+    buffer[37] = 'a';
+    buffer[38] = 't';
+    buffer[39] = 'a';
 
-    header[34] = bitsPerSample;
-    header[35] = 0;
-
-    memcpy(header + 36, "data", 4);
-
-    header[40] = dataSize & 0xFF;
-    header[41] = (dataSize >> 8) & 0xFF;
-    header[42] = (dataSize >> 16) & 0xFF;
-    header[43] = (dataSize >> 24) & 0xFF;
+    buffer[40] = dataSize & 0xFF;
+    buffer[41] = (dataSize >> 8) & 0xFF;
+    buffer[42] = (dataSize >> 16) & 0xFF;
+    buffer[43] = (dataSize >> 24) & 0xFF;
 }
 
-
 // ============================================================
-// WAIT FOR MICROPHONE DATA
+// START MICROPHONE
 // ============================================================
 
-bool waitForMicrophone()
-{
-    Serial.println("Waiting for microphone data...");
+void startMicrophone() {
 
-    unsigned long start = millis();
-
-    uint8_t testBuffer[256];
-
-    while (millis() - start < 3000)
-    {
-        size_t bytesRead =
-            I2S.readBytes(
-                (char*)testBuffer,
-                sizeof(testBuffer)
-            );
-
-        if (bytesRead > 0)
-        {
-            Serial.print("Microphone active. Bytes: ");
-            Serial.println(bytesRead);
-
-            return true;
-        }
-
-        delay(10);
-    }
-
-    Serial.println(
-        "ERROR: Microphone produced no data."
+    I2S.setPins(
+        MIC_BCLK,
+        MIC_WS,
+        -1,
+        MIC_SD,
+        -1
     );
 
-    return false;
+    I2S.begin(
+        I2S_MODE_STD,
+        SAMPLE_RATE,
+        I2S_DATA_BIT_WIDTH_32BIT,
+        I2S_SLOT_MODE_MONO
+    );
+
+    Serial.println("Microphone started.");
 }
 
-
 // ============================================================
-// RECORD
+// STOP MICROPHONE
 // ============================================================
 
-uint8_t* recordAudio(size_t* outputSize)
-{
-    *outputSize = 0;
-
-    if (!startMicrophone())
-    {
-        return nullptr;
-    }
-
-    if (!waitForMicrophone())
-    {
-        I2S.end();
-        return nullptr;
-    }
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("RECORDING");
-    Serial.println("Speak now...");
-    Serial.println("================================");
-
-    const uint32_t sampleCount =
-        SAMPLE_RATE * RECORD_SECONDS;
-
-    const uint32_t pcmBytes =
-        sampleCount * 2;
-
-    const uint32_t wavBytes =
-        pcmBytes + 44;
-
-    uint8_t* wav =
-        (uint8_t*)malloc(wavBytes);
-
-    if (!wav)
-    {
-        Serial.println(
-            "ERROR: Memory allocation failed."
-        );
-
-        I2S.end();
-
-        return nullptr;
-    }
-
-    writeWavHeader(
-        wav,
-        pcmBytes
-    );
-
-    uint32_t written = 0;
-
-    int32_t input[128];
-
-    while (written < pcmBytes)
-    {
-        size_t bytesRead =
-            I2S.readBytes(
-                (char*)input,
-                sizeof(input)
-            );
-
-        if (bytesRead == 0)
-        {
-            Serial.println(
-                "WARNING: temporary I2S read timeout."
-            );
-
-            delay(5);
-
-            continue;
-        }
-
-        int samples =
-            bytesRead /
-            sizeof(int32_t);
-
-        for (int i = 0; i < samples; i++)
-        {
-            if (written >= pcmBytes)
-                break;
-
-            // Convert INMP441 32-bit sample
-            // to signed 16-bit PCM.
-
-            int32_t sample =
-                input[i] >> 14;
-
-            if (sample > 32767)
-                sample = 32767;
-
-            if (sample < -32768)
-                sample = -32768;
-
-            int16_t sample16 =
-                (int16_t)sample;
-
-            wav[44 + written] =
-                sample16 & 0xFF;
-
-            wav[45 + written] =
-                (sample16 >> 8) & 0xFF;
-
-            written += 2;
-        }
-    }
+void stopMicrophone() {
 
     I2S.end();
 
-    *outputSize = wavBytes;
+    Serial.println("Microphone stopped.");
+}
 
-    Serial.print("Recorded WAV bytes: ");
-    Serial.println(wavBytes);
+// ============================================================
+// CALCULATE AUDIO LEVEL
+// ============================================================
+
+float calculateAudioLevel(int32_t* samples, int count) {
+
+    if (count <= 0) {
+        return 0;
+    }
+
+    double sum = 0;
+
+    for (int i = 0; i < count; i++) {
+
+        int32_t sample = samples[i];
+
+        // Convert 32-bit I2S value to approximate 16-bit
+        sample = sample >> 14;
+
+        if (sample < 0) {
+            sample = -sample;
+        }
+
+        sum += sample;
+    }
+
+    return sum / count;
+}
+
+// ============================================================
+// READ AUDIO CHUNK
+// ============================================================
+
+int readMicChunk(
+    int32_t* buffer,
+    int samplesToRead
+) {
+
+    size_t bytesRead = 0;
+
+    I2S.readBytes(
+        (char*)buffer,
+        samplesToRead * sizeof(int32_t)
+    );
+
+    bytesRead = samplesToRead * sizeof(int32_t);
+
+    return bytesRead / sizeof(int32_t);
+}
+
+// ============================================================
+// RECORD UNTIL SILENCE
+// ============================================================
+
+uint8_t* recordUntilSilence(
+    size_t& wavSize
+) {
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("CLARO VOICE DETECTION");
+    Serial.println("==============================");
+
+    Serial.println("Waiting for speech...");
+
+    // --------------------------------------------------------
+    // Allocate maximum possible WAV buffer
+    // --------------------------------------------------------
+
+    size_t maxDataSize =
+        MAX_SAMPLES * sizeof(int16_t);
+
+    size_t maxWavSize =
+        44 + maxDataSize;
+
+    uint8_t* wav =
+        (uint8_t*)malloc(maxWavSize);
+
+    if (!wav) {
+
+        Serial.println(
+            "ERROR: Could not allocate recording buffer."
+        );
+
+        wavSize = 0;
+
+        return nullptr;
+    }
+
+    // --------------------------------------------------------
+    // Temporary microphone buffer
+    // --------------------------------------------------------
+
+    int32_t* micBuffer =
+        (int32_t*)malloc(
+            LEVEL_CHUNK_SAMPLES *
+            sizeof(int32_t)
+        );
+
+    if (!micBuffer) {
+
+        Serial.println(
+            "ERROR: Could not allocate microphone buffer."
+        );
+
+        free(wav);
+
+        wavSize = 0;
+
+        return nullptr;
+    }
+
+    // --------------------------------------------------------
+    // Start microphone
+    // --------------------------------------------------------
+
+    startMicrophone();
+
+    delay(100);
+
+    // --------------------------------------------------------
+    // Flush initial microphone data
+    // --------------------------------------------------------
+
+    for (int i = 0; i < 3; i++) {
+
+        readMicChunk(
+            micBuffer,
+            LEVEL_CHUNK_SAMPLES
+        );
+    }
+
+    // --------------------------------------------------------
+    // WAIT FOR SPEECH
+    // --------------------------------------------------------
+
+    bool speechStarted = false;
+
+    unsigned long speechStartCandidate = 0;
+
+    while (!speechStarted) {
+
+        int count = readMicChunk(
+            micBuffer,
+            LEVEL_CHUNK_SAMPLES
+        );
+
+        float level =
+            calculateAudioLevel(
+                micBuffer,
+                count
+            );
+
+        Serial.print(
+            "Waiting level: "
+        );
+
+        Serial.println(level);
+
+        if (level >= SPEECH_THRESHOLD) {
+
+            if (speechStartCandidate == 0) {
+
+                speechStartCandidate =
+                    millis();
+            }
+
+            if (
+                millis() -
+                speechStartCandidate >=
+                SPEECH_CONFIRM_MS
+            ) {
+
+                speechStarted = true;
+
+                Serial.println();
+                Serial.println(
+                    ">>> SPEECH DETECTED <<<"
+                );
+
+            }
+
+        } else {
+
+            speechStartCandidate = 0;
+        }
+    }
+
+    // --------------------------------------------------------
+    // RECORDING
+    // --------------------------------------------------------
+
+    Serial.println("Recording...");
+
+    uint32_t sampleCount = 0;
+
+    unsigned long recordingStart =
+        millis();
+
+    unsigned long lastSpeechTime =
+        millis();
+
+    // --------------------------------------------------------
+    // Small pre-buffer
+    //
+    // We keep the first detected chunk so the
+    // beginning of the user's sentence isn't lost.
+    // --------------------------------------------------------
+
+    for (int i = 0; i < LEVEL_CHUNK_SAMPLES; i++) {
+
+        if (sampleCount >= MAX_SAMPLES) {
+            break;
+        }
+
+        int32_t sample =
+            micBuffer[i];
+
+        int16_t pcm =
+            (int16_t)(sample >> 14);
+
+        uint8_t* destination =
+            wav +
+            44 +
+            (sampleCount * 2);
+
+        destination[0] =
+            pcm & 0xFF;
+
+        destination[1] =
+            (pcm >> 8) & 0xFF;
+
+        sampleCount++;
+    }
+
+    // --------------------------------------------------------
+    // CONTINUE RECORDING
+    // --------------------------------------------------------
+
+    while (sampleCount < MAX_SAMPLES) {
+
+        int count = readMicChunk(
+            micBuffer,
+            LEVEL_CHUNK_SAMPLES
+        );
+
+        if (count <= 0) {
+            continue;
+        }
+
+        float level =
+            calculateAudioLevel(
+                micBuffer,
+                count
+            );
+
+        // --------------------------------------------
+        // Convert microphone data to 16-bit PCM
+        // --------------------------------------------
+
+        for (int i = 0; i < count; i++) {
+
+            if (sampleCount >= MAX_SAMPLES) {
+                break;
+            }
+
+            int32_t sample =
+                micBuffer[i];
+
+            int16_t pcm =
+                (int16_t)(sample >> 14);
+
+            uint8_t* destination =
+                wav +
+                44 +
+                (sampleCount * 2);
+
+            destination[0] =
+                pcm & 0xFF;
+
+            destination[1] =
+                (pcm >> 8) & 0xFF;
+
+            sampleCount++;
+        }
+
+        // --------------------------------------------
+        // Speech detected
+        // --------------------------------------------
+
+        if (level >= SPEECH_THRESHOLD) {
+
+            lastSpeechTime =
+                millis();
+
+            Serial.print(
+                "Speaking | Level: "
+            );
+
+            Serial.println(level);
+        }
+
+        // --------------------------------------------
+        // Silence detected
+        // --------------------------------------------
+
+        else {
+
+            unsigned long silenceTime =
+                millis() -
+                lastSpeechTime;
+
+            Serial.print(
+                "Silence | Level: "
+            );
+
+            Serial.print(level);
+
+            Serial.print(
+                " | Silence: "
+            );
+
+            Serial.print(silenceTime);
+
+            Serial.println(" ms");
+
+            if (
+                silenceTime >=
+                SILENCE_DURATION_MS
+            ) {
+
+                Serial.println();
+                Serial.println(
+                    ">>> END OF SPEECH <<<"
+                );
+
+                break;
+            }
+        }
+
+        // --------------------------------------------
+        // Maximum recording time
+        // --------------------------------------------
+
+        if (
+            millis() -
+            recordingStart >=
+            MAX_RECORD_SECONDS * 1000UL
+        ) {
+
+            Serial.println();
+            Serial.println(
+                ">>> MAX RECORDING TIME <<<"
+            );
+
+            break;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Stop microphone
+    // --------------------------------------------------------
+
+    stopMicrophone();
+
+    // --------------------------------------------------------
+    // Create WAV header
+    // --------------------------------------------------------
+
+    uint32_t dataSize =
+        sampleCount * sizeof(int16_t);
+
+    wavSize =
+        44 + dataSize;
+
+    writeWavHeader(
+        wav,
+        dataSize,
+        SAMPLE_RATE
+    );
+
+    // --------------------------------------------------------
+    // Cleanup temporary buffer
+    // --------------------------------------------------------
+
+    free(micBuffer);
+
+    // --------------------------------------------------------
+    // Print result
+    // --------------------------------------------------------
+
+    float duration =
+        (float)sampleCount /
+        SAMPLE_RATE;
+
+    Serial.println();
+    Serial.println(
+        "Recording complete."
+    );
+
+    Serial.print(
+        "Samples: "
+    );
+
+    Serial.println(sampleCount);
+
+    Serial.print(
+        "Duration: "
+    );
+
+    Serial.print(duration, 2);
+
+    Serial.println(" seconds");
+
+    Serial.print(
+        "WAV size: "
+    );
+
+    Serial.print(wavSize);
+
+    Serial.println(" bytes");
+
+    Serial.println(
+        "=============================="
+    );
 
     return wav;
 }
 
-
 // ============================================================
-// UPLOAD AUDIO
+// UPLOAD AUDIO TO BACKEND
 // ============================================================
 
 bool uploadAudio(
     uint8_t* wav,
     size_t wavSize
-)
-{
+) {
+
+    if (!wav || wavSize == 0) {
+
+        Serial.println(
+            "No audio to upload."
+        );
+
+        return false;
+    }
+
+    Serial.println();
+    Serial.println(
+        "Uploading audio..."
+    );
+
+    HTTPClient http;
+
     String url =
         String(BACKEND_URL) +
         "/upload-audio";
-
-    Serial.println();
-    Serial.println("Uploading audio...");
-    Serial.println(url);
-
-    HTTPClient http;
 
     http.begin(url);
 
@@ -341,28 +656,33 @@ bool uploadAudio(
         "audio/wav"
     );
 
-    int code =
+    http.setTimeout(30000);
+
+    int httpCode =
         http.POST(
             wav,
             wavSize
         );
 
-    Serial.print("HTTP status: ");
-    Serial.println(code);
+    Serial.print(
+        "HTTP status: "
+    );
 
-    if (code > 0)
-    {
-        String response =
-            http.getString();
+    Serial.println(httpCode);
 
-        Serial.println("Backend response:");
-        Serial.println(response);
+    if (httpCode != 200) {
+
+        Serial.println(
+            "Audio upload failed."
+        );
+
+        http.end();
+
+        return false;
     }
 
-    http.end();
-
-    if (code == 200)
-{
+    // IMPORTANT:
+    // Read response BEFORE http.end()
     String response =
         http.getString();
 
@@ -370,148 +690,107 @@ bool uploadAudio(
         "Backend response:"
     );
 
-    Serial.println(
-        response
-    );
+    Serial.println(response);
 
     http.end();
 
-    // No question / no answer
+    // --------------------------------------------------------
+    // No speech detected
+    // --------------------------------------------------------
+
     if (
         response.indexOf(
             "\"question\":\"\""
         ) >= 0
-    )
-    {
-        Serial.println();
-        Serial.println(
-            "No speech detected."
-        );
+    ) {
 
         Serial.println(
-            "Listening again..."
+            "Backend detected no speech."
         );
 
         return false;
     }
 
-    Serial.println();
+    // --------------------------------------------------------
+    // Real question detected
+    // --------------------------------------------------------
+
     Serial.println(
-        "Question received."
+        "Question detected."
     );
 
     return true;
 }
 
-    Serial.println(
-        "Audio upload failed."
-    );
-
-    return false;
-}
-
-
 // ============================================================
-// START SPEAKER
+// SPEAKER START
 // ============================================================
 
-bool startSpeaker()
-{
-    Serial.println();
-    Serial.println(
-        "Starting MAX98357A..."
-    );
-
-    I2S.end();
-
-    delay(100);
+void startSpeaker() {
 
     I2S.setPins(
         SPK_BCLK,
-        SPK_WS,
-        SPK_DATA,
+        SPK_LRC,
+        SPK_DOUT,
+        -1,
         -1
     );
 
-    bool ok = I2S.begin(
+    I2S.begin(
         I2S_MODE_STD,
-        16000,
+        SAMPLE_RATE,
         I2S_DATA_BIT_WIDTH_16BIT,
-        I2S_SLOT_MODE_MONO,
-        I2S_STD_SLOT_LEFT
+        I2S_SLOT_MODE_MONO
     );
-
-    if (!ok)
-    {
-        Serial.println(
-            "ERROR: Speaker I2S failed."
-        );
-
-        return false;
-    }
 
     Serial.println(
-        "Speaker I2S ready."
+        "Speaker started."
     );
-
-    return true;
 }
 
-
 // ============================================================
-// DOWNLOAD + PLAY WAV
+// PLAY RESPONSE
 // ============================================================
 
-bool playResponse()
-{
-    String url =
-        String(BACKEND_URL) +
-        "/audio";
+void playResponse() {
 
     Serial.println();
     Serial.println(
-        "Downloading CLARO response..."
+        "Downloading response audio..."
     );
 
     HTTPClient http;
 
+    String url =
+        String(BACKEND_URL) +
+        "/audio";
+
     http.begin(url);
 
-    int code =
+    http.setTimeout(30000);
+
+    int httpCode =
         http.GET();
 
-    Serial.print("HTTP status: ");
-    Serial.println(code);
+    Serial.print(
+        "Audio HTTP status: "
+    );
 
-    if (code != 200)
-    {
+    Serial.println(httpCode);
+
+    if (httpCode != 200) {
+
         Serial.println(
-            "ERROR: Audio download failed."
+            "Failed to download response."
         );
 
         http.end();
 
-        return false;
+        return;
     }
-
-    int totalSize =
-        http.getSize();
-
-    Serial.print(
-        "Audio size: "
-    );
-
-    Serial.println(totalSize);
 
     WiFiClient* stream =
         http.getStreamPtr();
-
-    if (!startSpeaker())
-    {
-        http.end();
-
-        return false;
-    }
 
     // --------------------------------------------------------
     // Skip WAV header
@@ -519,63 +798,70 @@ bool playResponse()
 
     uint8_t header[44];
 
-    size_t headerRead = 0;
+    int headerRead = 0;
 
-    unsigned long timeout =
+    unsigned long headerStart =
         millis();
 
     while (
         headerRead < 44 &&
-        millis() - timeout < 5000
-    )
-    {
-        if (stream->available())
-        {
-            size_t available =
+        millis() - headerStart < 5000
+    ) {
+
+        if (stream->available()) {
+
+            int available =
                 stream->available();
 
-            size_t needed =
+            int needed =
                 44 - headerRead;
 
-            if (available > needed)
-                available = needed;
-
-            size_t n =
-                stream->readBytes(
-                    (char*)(
-                        header +
-                        headerRead
-                    ),
-                    available
+            int toRead =
+                min(
+                    available,
+                    needed
                 );
 
-            headerRead += n;
-        }
+            int received =
+                stream->readBytes(
+                    header + headerRead,
+                    toRead
+                );
 
-        delay(1);
+            headerRead += received;
+
+        } else {
+
+            delay(1);
+        }
     }
 
-    if (headerRead != 44)
-    {
+    if (headerRead < 44) {
+
         Serial.println(
-            "ERROR: WAV header failed."
+            "Could not read WAV header."
         );
 
-        I2S.end();
         http.end();
 
-        return false;
+        return;
     }
 
-    // --------------------------------------------------------
-    // Play PCM
-    // --------------------------------------------------------
-
     Serial.println(
-        "Playing CLARO..."
+        "WAV header received."
     );
 
-    uint8_t buffer[1024];
+    // --------------------------------------------------------
+    // Start speaker
+    // --------------------------------------------------------
+
+    startSpeaker();
+
+    // --------------------------------------------------------
+    // Stream audio
+    // --------------------------------------------------------
+
+    uint8_t audioBuffer[2048];
 
     unsigned long lastData =
         millis();
@@ -583,77 +869,75 @@ bool playResponse()
     while (
         http.connected() ||
         stream->available()
-    )
-    {
+    ) {
+
         int available =
             stream->available();
 
-        if (available > 0)
-        {
-            int amount =
-                available;
+        if (available > 0) {
 
-            if (amount >
-                (int)sizeof(buffer))
-            {
-                amount =
-                    sizeof(buffer);
-            }
-
-            int n =
-                stream->readBytes(
-                    (char*)buffer,
-                    amount
+            int toRead =
+                min(
+                    available,
+                    (int)sizeof(audioBuffer)
                 );
 
-            if (n > 0)
-            {
+            int received =
+                stream->readBytes(
+                    audioBuffer,
+                    toRead
+                );
+
+            if (received > 0) {
+
                 I2S.write(
-                    buffer,
-                    n
+                    audioBuffer,
+                    received
                 );
 
                 lastData =
                     millis();
             }
-        }
-        else
-        {
-            delay(2);
-        }
 
-        // Prevent endless waiting
-        if (
-            millis() - lastData >
-            5000
-        )
-        {
-            break;
+        } else {
+
+            if (
+                millis() -
+                lastData > 3000
+            ) {
+
+                break;
+            }
+
+            delay(1);
         }
     }
+
+    // --------------------------------------------------------
+    // Stop speaker
+    // --------------------------------------------------------
 
     I2S.end();
 
     http.end();
 
     Serial.println(
-        "Playback finished."
+        "Response playback complete."
     );
-
-    return true;
 }
 
-
 // ============================================================
-// WIFI
+// CONNECT WIFI
 // ============================================================
 
-void connectWiFi()
-{
+void connectWiFi() {
+
     Serial.println();
     Serial.println(
-        "Connecting to WiFi..."
+        "Connecting to Wi-Fi..."
     );
+
+    WiFi.mode(WIFI_STA);
 
     WiFi.begin(
         WIFI_SSID,
@@ -664,9 +948,9 @@ void connectWiFi()
 
     while (
         WiFi.status() != WL_CONNECTED &&
-        attempts < 30
-    )
-    {
+        attempts < 40
+    ) {
+
         delay(500);
 
         Serial.print(".");
@@ -679,10 +963,10 @@ void connectWiFi()
     if (
         WiFi.status() ==
         WL_CONNECTED
-    )
-    {
+    ) {
+
         Serial.println(
-            "WiFi connected."
+            "Wi-Fi connected."
         );
 
         Serial.print(
@@ -692,22 +976,21 @@ void connectWiFi()
         Serial.println(
             WiFi.localIP()
         );
-    }
-    else
-    {
+
+    } else {
+
         Serial.println(
-            "ERROR: WiFi connection failed."
+            "Wi-Fi connection failed."
         );
     }
 }
-
 
 // ============================================================
 // SETUP
 // ============================================================
 
-void setup()
-{
+void setup() {
+
     Serial.begin(115200);
 
     delay(1500);
@@ -717,7 +1000,10 @@ void setup()
         "================================"
     );
     Serial.println(
-        "       CLARO V1 ESP32-S3"
+        "       CLARO V1"
+    );
+    Serial.println(
+        " Voice Activity Detection"
     );
     Serial.println(
         "================================"
@@ -727,78 +1013,105 @@ void setup()
 
     Serial.println();
     Serial.println(
-        "CLARO ready."
+        "CLARO is ready."
     );
 }
-
 
 // ============================================================
 // LOOP
 // ============================================================
 
-void loop()
-{
+void loop() {
+
+    // --------------------------------------------------------
+    // Make sure Wi-Fi is connected
+    // --------------------------------------------------------
+
     if (
         WiFi.status() !=
         WL_CONNECTED
-    )
-    {
-        connectWiFi();
-    }
+    ) {
 
-    size_t wavSize = 0;
-
-    uint8_t* wav =
-        recordAudio(&wavSize);
-
-    if (wav == nullptr)
-    {
-        Serial.println();
         Serial.println(
-            "Recording failed."
+            "Wi-Fi disconnected."
         );
 
-        delay(2000);
+        connectWiFi();
+
+        delay(1000);
 
         return;
     }
 
+    // --------------------------------------------------------
+    // Wait for speech and record
+    // --------------------------------------------------------
+
+    size_t wavSize = 0;
+
+    uint8_t* wav =
+        recordUntilSilence(
+            wavSize
+        );
+
+    // --------------------------------------------------------
+    // Recording failed
+    // --------------------------------------------------------
+
+    if (!wav || wavSize == 0) {
+
+        Serial.println(
+            "Recording failed."
+        );
+
+        if (wav) {
+            free(wav);
+        }
+
+        delay(500);
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Upload
+    // --------------------------------------------------------
+
     bool uploaded =
-    uploadAudio(
-        wav,
-        wavSize
-    );
+        uploadAudio(
+            wav,
+            wavSize
+        );
 
-free(wav);
+    // --------------------------------------------------------
+    // Free recording memory
+    // --------------------------------------------------------
 
-if (uploaded)
-{
-    delay(100);
+    free(wav);
 
-    playResponse();
-}
-else
-{
-    // No speech.
-    // Do not play anything.
+    wav = nullptr;
 
-    Serial.println(
-        "Nothing to answer."
-    );
-}
+    // --------------------------------------------------------
+    // Play response only if a real question exists
+    // --------------------------------------------------------
+
+    if (uploaded) {
+
+        delay(100);
+
+        playResponse();
+
+    } else {
+
+        Serial.println(
+            "Nothing to answer."
+        );
+    }
 
     Serial.println();
     Serial.println(
-        "================================"
+        "Returning to voice detection..."
     );
 
-    Serial.println(
-        "Cycle complete."
-    );
-
-    Serial.println(
-        "================================"
-    );
-
-    delay(2000);
+    delay(200);
 }
