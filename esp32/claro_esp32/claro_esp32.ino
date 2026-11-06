@@ -2,7 +2,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "ESP_I2S.h"
-
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 // ============================================================
 // CLARO V1 - ESP32-S3
 // Voice Activity Detection Recording
@@ -72,6 +74,280 @@ const char* BACKEND_URL = "http://192.168.219.101:8001";
 // ============================================================
 
 I2SClass I2S;
+
+
+// ============================================================
+// CLARO DISPLAY - ST7789
+// ============================================================
+
+#define TFT_CS   10
+#define TFT_DC   13
+#define TFT_RST  14
+#define TFT_MOSI 11
+#define TFT_SCLK 12
+
+SPIClass displaySPI(FSPI);
+
+Adafruit_ST7789 tft = Adafruit_ST7789(
+  &displaySPI,
+  TFT_CS,
+  TFT_DC,
+  TFT_RST
+);
+
+// Display colors
+#define FACE_BG     0x0841
+#define FACE_CYAN   0x07FF
+#define FACE_WHITE  0xFFFF
+#define FACE_PUPIL  0x0210
+
+// Face states
+enum FaceState {
+  FACE_IDLE,
+  FACE_LISTENING,
+  FACE_THINKING,
+  FACE_SPEAKING,
+  FACE_ERROR
+};
+
+FaceState currentFaceState = FACE_IDLE;
+
+bool eyesClosed = false;
+bool mouthOpen = false;
+
+int lookOffset = 0;
+int lookDirection = 1;
+
+unsigned long nextBlink = 0;
+unsigned long reopenEyesAt = 0;
+unsigned long nextLook = 0;
+unsigned long nextMouthChange = 0;
+
+
+// Draw eyes
+void drawFaceEyes(bool closed) {
+
+  tft.fillRect(35, 30, 250, 145, FACE_BG);
+
+  if (closed) {
+
+    tft.drawLine(65, 112, 145, 112, FACE_CYAN);
+    tft.drawLine(175, 112, 255, 112, FACE_CYAN);
+
+  } else {
+
+    tft.fillRoundRect(65, 48, 80, 112, 38, FACE_CYAN);
+    tft.fillRoundRect(175, 48, 80, 112, 38, FACE_CYAN);
+
+    int pupilOffset = lookOffset;
+
+    if (currentFaceState == FACE_THINKING) {
+      pupilOffset += 7;
+    }
+
+    tft.fillCircle(
+      105 + pupilOffset, 112, 15, FACE_PUPIL
+    );
+
+    tft.fillCircle(
+      215 + pupilOffset, 112, 15, FACE_PUPIL
+    );
+
+    tft.fillCircle(
+      99 + pupilOffset, 105, 6, FACE_WHITE
+    );
+
+    tft.fillCircle(
+      209 + pupilOffset, 105, 6, FACE_WHITE
+    );
+  }
+}
+
+
+// Draw mouth
+void drawFaceMouth() {
+
+  tft.fillRect(110, 175, 100, 55, FACE_BG);
+
+  if (currentFaceState == FACE_SPEAKING) {
+
+    if (mouthOpen) {
+
+      tft.fillRoundRect(
+        145, 183, 30, 38, 14, FACE_CYAN
+      );
+
+      tft.fillRoundRect(
+        152, 190, 16, 23, 8, FACE_PUPIL
+      );
+
+    } else {
+
+      tft.drawLine(137, 195, 148, 202, FACE_CYAN);
+      tft.drawLine(148, 202, 172, 202, FACE_CYAN);
+      tft.drawLine(172, 202, 183, 195, FACE_CYAN);
+    }
+
+  } else if (currentFaceState == FACE_THINKING) {
+
+    tft.drawLine(145, 198, 175, 198, FACE_CYAN);
+
+  } else if (currentFaceState == FACE_ERROR) {
+
+    tft.drawLine(137, 207, 148, 198, FACE_CYAN);
+    tft.drawLine(148, 198, 172, 198, FACE_CYAN);
+    tft.drawLine(172, 198, 183, 207, FACE_CYAN);
+
+  } else {
+
+    // Friendly smile
+    tft.drawLine(132, 190, 145, 199, FACE_CYAN);
+    tft.drawLine(145, 199, 160, 202, FACE_CYAN);
+    tft.drawLine(160, 202, 175, 199, FACE_CYAN);
+    tft.drawLine(175, 199, 188, 190, FACE_CYAN);
+  }
+}
+
+
+// Draw complete face
+void renderFace() {
+
+  tft.fillScreen(FACE_BG);
+
+  drawFaceEyes(false);
+  drawFaceMouth();
+}
+
+
+// Change expression
+void setFaceState(FaceState newState) {
+
+  if (currentFaceState == newState) {
+    return;
+  }
+
+  currentFaceState = newState;
+
+  eyesClosed = false;
+  mouthOpen = false;
+  lookOffset = 0;
+
+  unsigned long now = millis();
+
+  nextBlink = now + 3000;
+  nextLook = now + 700;
+  nextMouthChange = now + 180;
+
+  renderFace();
+
+  Serial.print("DISPLAY STATE: ");
+
+  switch (newState) {
+
+    case FACE_IDLE:
+      Serial.println("IDLE");
+      break;
+
+    case FACE_LISTENING:
+      Serial.println("LISTENING");
+      break;
+
+    case FACE_THINKING:
+      Serial.println("THINKING");
+      break;
+
+    case FACE_SPEAKING:
+      Serial.println("SPEAKING");
+      break;
+
+    case FACE_ERROR:
+      Serial.println("ERROR");
+      break;
+  }
+}
+
+
+// Initialize display
+void initDisplay() {
+
+  Serial.println("Initializing CLARO display...");
+
+  displaySPI.begin(
+    TFT_SCLK,
+    -1,
+    TFT_MOSI,
+    TFT_CS
+  );
+
+  tft.init(240, 320);
+  tft.setRotation(1);
+
+  currentFaceState = FACE_ERROR;
+
+  setFaceState(FACE_IDLE);
+
+  Serial.println("CLARO display initialized.");
+}
+
+
+// Update animations
+void updateFace() {
+
+  unsigned long now = millis();
+
+  // Eye blinking
+  if (!eyesClosed && now >= nextBlink) {
+
+    eyesClosed = true;
+
+    drawFaceEyes(true);
+
+    reopenEyesAt = now + 150;
+  }
+
+  if (eyesClosed && now >= reopenEyesAt) {
+
+    eyesClosed = false;
+
+    drawFaceEyes(false);
+
+    nextBlink = now + 2500 + (now % 1500);
+  }
+
+  // Eye movement
+  if (!eyesClosed && now >= nextLook) {
+
+    lookOffset += lookDirection * 4;
+
+    if (lookOffset >= 8) {
+      lookOffset = 8;
+      lookDirection = -1;
+    }
+
+    if (lookOffset <= -8) {
+      lookOffset = -8;
+      lookDirection = 1;
+    }
+
+    drawFaceEyes(false);
+
+    nextLook = now + 600;
+  }
+
+  // Speaking mouth animation
+  if (
+    currentFaceState == FACE_SPEAKING &&
+    now >= nextMouthChange
+  ) {
+
+    mouthOpen = !mouthOpen;
+
+    drawFaceMouth();
+
+    nextMouthChange = now + 180;
+  }
+}
+
 
 // ============================================================
 // WAV HEADER
@@ -253,7 +529,7 @@ uint8_t* recordUntilSilence(
     Serial.println("==============================");
     Serial.println("CLARO VOICE DETECTION");
     Serial.println("==============================");
-
+    setFaceState(FACE_IDLE);
     Serial.println("Waiting for speech...");
 
     // --------------------------------------------------------
@@ -316,7 +592,7 @@ uint8_t* recordUntilSilence(
     // --------------------------------------------------------
 
     for (int i = 0; i < 3; i++) {
-
+        
         readMicChunk(
             micBuffer,
             LEVEL_CHUNK_SAMPLES
@@ -332,7 +608,7 @@ uint8_t* recordUntilSilence(
     unsigned long speechStartCandidate = 0;
 
     while (!speechStarted) {
-
+        updateFace();
         int count = readMicChunk(
             micBuffer,
             LEVEL_CHUNK_SAMPLES
@@ -365,7 +641,7 @@ uint8_t* recordUntilSilence(
             ) {
 
                 speechStarted = true;
-
+                setFaceState(FACE_LISTENING);
                 Serial.println();
                 Serial.println(
                     ">>> SPEECH DETECTED <<<"
@@ -431,7 +707,7 @@ uint8_t* recordUntilSilence(
     // --------------------------------------------------------
 
     while (sampleCount < MAX_SAMPLES) {
-
+        updateFace();
         int count = readMicChunk(
             micBuffer,
             LEVEL_CHUNK_SAMPLES
@@ -639,6 +915,7 @@ bool uploadAudio(
     }
 
     Serial.println();
+    setFaceState(FACE_THINKING);
     Serial.println(
         "Uploading audio..."
     );
@@ -931,7 +1208,7 @@ void playResponse() {
 // ============================================================
 
 void connectWiFi() {
-
+    setFaceState(FACE_THINKING);
     Serial.println();
     Serial.println(
         "Connecting to Wi-Fi..."
@@ -947,6 +1224,7 @@ void connectWiFi() {
     int attempts = 0;
 
     while (
+        updateFace();
         WiFi.status() != WL_CONNECTED &&
         attempts < 40
     ) {
@@ -976,12 +1254,14 @@ void connectWiFi() {
         Serial.println(
             WiFi.localIP()
         );
+        setFaceState(FACE_IDLE);
 
     } else {
 
         Serial.println(
             "Wi-Fi connection failed."
         );
+        setFaceState(FACE_ERROR);
     }
 }
 
@@ -994,7 +1274,7 @@ void setup() {
     Serial.begin(115200);
 
     delay(1500);
-
+    initDisplay();
     Serial.println();
     Serial.println(
         "================================"

@@ -1,285 +1,505 @@
 
-import json
+import sqlite3
 import re
-
-DATABASE_FILE = "database/bic_knowledge.json"
-
-
-# Words that usually don't help identify the topic.
-STOP_WORDS = {
-    "what", "where", "when", "who", "why", "how",
-    "is", "are", "the", "a", "an", "of", "to",
-    "in", "on", "for", "and", "or", "do", "does",
-    "can", "i", "me", "tell", "about", "please",
-    "there", "this", "that"
-}
+from pathlib import Path
 
 
-def load_knowledge():
-    try:
-        with open(
-            DATABASE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            return json.load(file)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-    except FileNotFoundError:
-        print("Knowledge database not found.")
-        return []
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_FILE = BASE_DIR / "claro.db"
 
+FAQ_MATCH_THRESHOLD = 2
+KNOWLEDGE_MATCH_THRESHOLD = 2
+
+# Maximum length of each knowledge text section.
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+
+
+# ============================================================
+# TEXT PROCESSING
+# ============================================================
 
 def tokenize(text):
-    words = re.findall(
-        r"[a-zA-Z0-9]+",
+    """
+    Convert text into searchable words.
+
+    Supports English, numbers, and Korean characters.
+    """
+
+    if not text:
+        return []
+
+    return re.findall(
+        r"[a-zA-Z0-9가-힣]+",
         text.lower()
     )
 
-    return {
-        word
-        for word in words
-        if word not in STOP_WORDS
-        and len(word) > 1
-    }
 
+def normalize(text):
+    """
+    Normalize text for comparison.
+    """
+
+    return " ".join(tokenize(text))
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_connection():
+    """
+    Open the local SQLite database.
+    """
+
+    if not DATABASE_FILE.exists():
+        raise FileNotFoundError(
+            f"Database not found: {DATABASE_FILE}"
+        )
+
+    connection = sqlite3.connect(DATABASE_FILE)
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+# ============================================================
+# FAQ SEARCH
+# ============================================================
+
+def search_faq(question):
+    """
+    Search the FAQ table first.
+
+    Returns the best matching FAQ answer.
+    Returns None when no sufficiently strong match exists.
+    """
+
+    query = normalize(question)
+
+    if not query:
+        return None
+
+    query_tokens = set(tokenize(question))
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            SELECT id, category, question, answer, keywords
+            FROM faq
+        """)
+
+        rows = cursor.fetchall()
+        connection.close()
+
+    except sqlite3.Error as error:
+        print("FAQ database error:", error)
+        return None
+
+    best_match = None
+    best_score = 0
+
+    for row in rows:
+
+        faq_question = row["question"] or ""
+        faq_answer = row["answer"] or ""
+        faq_keywords = row["keywords"] or ""
+
+        normalized_faq_question = normalize(faq_question)
+
+        faq_question_tokens = set(
+            tokenize(faq_question)
+        )
+
+        keyword_tokens = set(
+            tokenize(faq_keywords)
+        )
+
+        score = 0
+
+        # Exact question match.
+        if query == normalized_faq_question:
+            score = 100
+
+        # Full question phrase match.
+        elif (
+            normalized_faq_question
+            and normalized_faq_question in query
+        ):
+            score = 50
+
+        else:
+
+            # Matching question words.
+            question_matches = (
+                query_tokens & faq_question_tokens
+            )
+
+            # Matching keywords.
+            keyword_matches = (
+                query_tokens & keyword_tokens
+            )
+
+            score += len(question_matches) * 2
+            score += len(keyword_matches)
+
+            # Reward matching the complete query phrase.
+            if query and query in normalized_faq_question:
+                score += 3
+
+        if score > best_score:
+            best_score = score
+
+            best_match = {
+                "id": row["id"],
+                "category": row["category"],
+                "question": faq_question,
+                "answer": faq_answer,
+                "score": score
+            }
+
+    if best_match and best_score >= FAQ_MATCH_THRESHOLD:
+
+        print("\n[FAQ MATCH]")
+        print("Category:", best_match["category"])
+        print("Question:", best_match["question"])
+        print("Score:", best_match["score"])
+
+        return best_match
+
+    return None
+
+
+# ============================================================
+# KNOWLEDGE DATABASE
+# ============================================================
+
+def load_knowledge():
+    """
+    Load previously stored campus information
+    from the knowledge table.
+    """
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            SELECT id, url, title, content
+            FROM knowledge
+        """)
+
+        rows = cursor.fetchall()
+        connection.close()
+
+        knowledge = []
+
+        for row in rows:
+
+            knowledge.append({
+                "id": row["id"],
+                "url": row["url"],
+                "title": row["title"],
+                "text": row["content"]
+            })
+
+        return knowledge
+
+    except sqlite3.Error as error:
+
+        print("Knowledge database error:", error)
+        return []
+
+
+# ============================================================
+# SPLIT KNOWLEDGE INTO SMALL SECTIONS
+# ============================================================
 
 def split_into_chunks(text):
     """
-    Break a webpage into small searchable pieces.
+    Divide long knowledge text into smaller sections.
     """
 
-    # First split by common sentence boundaries.
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        text
-    )
+    if not text:
+        return []
+
+    words = text.split()
+
+    if len(words) <= CHUNK_SIZE:
+        return [text]
 
     chunks = []
 
-    for sentence in sentences:
+    start = 0
 
-        sentence = sentence.strip()
+    while start < len(words):
 
-        if len(sentence) < 20:
-            continue
+        end = start + CHUNK_SIZE
 
-        chunks.append(sentence)
+        chunk = " ".join(words[start:end])
+
+        if chunk.strip():
+            chunks.append(chunk)
+
+        start += CHUNK_SIZE - CHUNK_OVERLAP
 
     return chunks
 
 
-def search_knowledge(question, top_k=3):
+# ============================================================
+# KNOWLEDGE SEARCH
+# ============================================================
 
-    knowledge = load_knowledge()
+def search_knowledge(question):
+    """
+    Search the knowledge table when no FAQ matches.
+    """
 
-    if not knowledge:
-        return []
+    query_tokens = set(tokenize(question))
 
-    question_words = tokenize(question)
+    if not query_tokens:
+        return None
 
-    results = []
+    knowledge_data = load_knowledge()
 
-    for page in knowledge:
+    best_match = None
+    best_score = 0
 
-        title = page.get("title", "")
-        url = page.get("url", "")
-        text = page.get("text", "")
+    for item in knowledge_data:
 
-        chunks = split_into_chunks(text)
+        title = item["title"] or ""
+        content = item["text"] or ""
+
+        title_tokens = set(tokenize(title))
+
+        chunks = split_into_chunks(content)
 
         for chunk in chunks:
 
-            chunk_words = tokenize(
-                title + " " + chunk
+            chunk_tokens = set(tokenize(chunk))
+
+            score = 0
+
+            # Content word matches.
+            content_matches = (
+                query_tokens & chunk_tokens
             )
 
-            matching_words = (
-                question_words & chunk_words
-            )
+            score += len(content_matches)
 
-            score = len(matching_words)
-
-            # Give a small bonus when words
-            # appear in the page title.
-            title_words = tokenize(title)
-
+            # Title matches receive extra weight.
             title_matches = (
-                question_words & title_words
+                query_tokens & title_tokens
             )
 
             score += len(title_matches) * 2
 
-            if score > 0:
+            if score > best_score:
 
-                results.append({
-                    "score": score,
-                    "text": chunk,
+                best_score = score
+
+                best_match = {
                     "title": title,
-                    "url": url
-                })
+                    "text": chunk,
+                    "url": item["url"],
+                    "score": score
+                }
 
-    # Highest score first.
-    results.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
+    if best_match and best_score >= KNOWLEDGE_MATCH_THRESHOLD:
 
-    return results[:top_k]
+        print("\n[KNOWLEDGE MATCH]")
+        print("Title:", best_match["title"])
+        print("Score:", best_match["score"])
+
+        return best_match
+
+    return None
 
 
-def make_answer(question):
+# ============================================================
+# BASIC INTENTS
+# ============================================================
 
-    q = question.lower().strip()
-
-    # Remove punctuation
-    q = q.replace(".", "")
-    q = q.replace(",", "")
-    q = q.replace("!", "")
-    q = q.replace("?", "")
-    q = q.strip()
-
-    # ==================================================
-    # GREETINGS
-    # ==================================================
+def is_greeting(question):
 
     greetings = {
         "hi",
         "hello",
         "hey",
-        "hi claro",
-        "hello claro",
-        "hey claro",
         "good morning",
         "good afternoon",
-        "good evening"
+        "good evening",
+        "hi claro",
+        "hello claro"
     }
 
-    if q in greetings:
+    normalized_question = normalize(question)
+
+    return normalized_question in {
+        normalize(item) for item in greetings
+    }
+
+
+def is_identity_question(question):
+
+    patterns = [
+        "who are you",
+        "what are you",
+        "introduce yourself",
+        "what is your name",
+        "your name"
+    ]
+
+    normalized_question = normalize(question)
+
+    return any(
+        pattern in normalized_question
+        for pattern in patterns
+    )
+
+
+def is_capability_question(question):
+
+    patterns = [
+        "what can you do",
+        "your features",
+        "your capabilities",
+        "how can you help",
+        "what do you do"
+    ]
+
+    normalized_question = normalize(question)
+
+    return any(
+        pattern in normalized_question
+        for pattern in patterns
+    )
+
+
+# ============================================================
+# ANSWER GENERATION
+# ============================================================
+
+def make_answer(question):
+    """
+    Main CLARO question-answering function.
+
+    Priority:
+        1. Greeting
+        2. CLARO identity
+        3. CLARO capabilities
+        4. SQLite FAQ
+        5. SQLite knowledge
+        6. Unknown question response
+    """
+
+    if not question or not question.strip():
+
         return (
-            "Hello! I'm CLARO, your intelligent campus companion. "
+            "I didn't hear a question. "
+            "Could you please ask again?"
+        )
+
+    question = question.strip()
+
+    print("\n" + "=" * 50)
+    print("CLARO QUESTION:", question)
+    print("=" * 50)
+
+    # --------------------------------------------------------
+    # 1. Greeting
+    # --------------------------------------------------------
+
+    if is_greeting(question):
+
+        return (
+            "Hello! I am CLARO, your intelligent campus companion. "
             "How can I help you today?"
         )
 
-    # ==================================================
-    # WHO ARE YOU?
-    # ==================================================
+    # --------------------------------------------------------
+    # 2. Identity
+    # --------------------------------------------------------
 
-    identity_phrases = [
-        "who are you",
-        "who are you?",
-        "what are you",
-        "what is your name",
-        "what's your name",
-        "tell me about yourself"
-    ]
+    if is_identity_question(question):
 
-    if any(
-        phrase in q
-        for phrase in identity_phrases
-    ):
         return (
-            "I'm CLARO, your intelligent campus companion. "
-            "I can help you find information about Tongmyong University "
-            "and BIC."
+            "I am CLARO, your intelligent campus companion. "
+            "I am designed to help students find information "
+            "about Busan International College and Tongmyong University."
         )
 
-    # ==================================================
-    # WHAT CAN YOU DO?
-    # ==================================================
+    # --------------------------------------------------------
+    # 3. Capabilities
+    # --------------------------------------------------------
 
-    capability_phrases = [
-        "what can you do",
-        "what do you do",
-        "how can you help",
-        "what are your functions",
-        "what are your features",
-        "what can claro do",
-        "how can claro help"
-    ]
+    if is_capability_question(question):
 
-    if any(
-        phrase in q
-        for phrase in capability_phrases
-    ):
         return (
-            "I can help you find campus information, "
-            "answer questions about BIC and Tongmyong University, "
-            "and provide information about programs, admissions, "
-            "campus facilities, and other university services."
+            "I can help you find information about Busan International "
+            "College, academic programs, professors, campus information, "
+            "and student services. You can simply ask me a question."
         )
 
-    # ==================================================
-    # NORMAL CAMPUS QUESTION
-    # ==================================================
+    # --------------------------------------------------------
+    # 4. Search FAQ database first
+    # --------------------------------------------------------
 
-    results = search_knowledge(
-        question,
-        top_k=3
+    faq_result = search_faq(question)
+
+    if faq_result:
+
+        return faq_result["answer"]
+
+    # --------------------------------------------------------
+    # 5. Search general knowledge database
+    # --------------------------------------------------------
+
+    knowledge_result = search_knowledge(question)
+
+    if knowledge_result:
+
+        return (
+            f"According to the stored information about "
+            f"{knowledge_result['title']}: "
+            f"{knowledge_result['text']}"
+        )
+
+    # --------------------------------------------------------
+    # 6. No answer found
+    # --------------------------------------------------------
+
+    return (
+        "I am sorry, but I don't have enough stored information "
+        "to answer that question. Please contact the BIC "
+        "Education Support Team for further assistance."
     )
 
-    if not results:
-        return (
-            "Sorry, I couldn't find that information "
-            "in my campus database."
-        )
 
-    answer_parts = []
-
-    for result in results:
-
-        text = result["text"]
-
-        if text not in answer_parts:
-            answer_parts.append(text)
-
-    answer = " ".join(
-        answer_parts[:3]
-    )
-
-    words = answer.split()
-
-    if len(words) > 70:
-        answer = " ".join(
-            words[:70]
-        ) + "."
-
-    return answer
-
+# ============================================================
+# TERMINAL TESTING
+# ============================================================
 
 if __name__ == "__main__":
 
-    print("=" * 40)
-    print("CLARO V1 SEARCH TEST")
-    print("=" * 40)
-    print("Type 'exit' to quit.")
+    print("\nCLARO OFFLINE QUESTION ANSWERING SYSTEM")
+    print("Type 'exit' to stop.")
 
     while True:
 
-        question = input("\nYou: ").strip()
+        user_question = input("\nYou: ").strip()
 
-        if question.lower() in [
-            "exit",
-            "quit"
-        ]:
+        if user_question.lower() in ["exit", "quit"]:
+
+            print("CLARO: Goodbye!")
             break
 
-        results = search_knowledge(question)
+        answer = make_answer(user_question)
 
-        print("\nSearch results:")
-
-        for result in results:
-
-            print(
-                f"\nScore: {result['score']}"
-            )
-
-            print(
-                f"Page: {result['title']}"
-            )
-
-            print(
-                f"Text: {result['text']}"
-            )
-
-        print("\nCLARO:")
-        print(make_answer(question))
+        print("\nCLARO:", answer)
