@@ -17,11 +17,11 @@
 // -----------------------------
 
 // Enter your Wi-Fi credentials here. Do not share this file with real credentials.
-const char* WIFI_SSID = "U+Net2DD0";
-const char* WIFI_PASSWORD = "8CD#B9BHB8";
+const char* WIFI_SSID = "claro";
+const char* WIFI_PASSWORD = "12345678";
 
 // PC backend
-const char* BACKEND_URL = "http://192.168.219.101:8001";
+const char* BACKEND_URL = "http://192.168.0.5:8001";
 
 // ============================================================
 // I2S MICROPHONE - INMP441
