@@ -104,6 +104,7 @@ claro-v1/
 ├── qa.py
 ├── stt.py
 ├── tts.py
+├── claro.db
 ├── database/
 │   └── bic_knowledge.json
 ├── audio/
@@ -115,7 +116,10 @@ claro-v1/
 
 CLARO V1 uses local keyword-based campus search rather than an LLM or vector database. Speech processing runs on the PC; the ESP32-S3 controls the physical interface.
 
-**Project lead:** Mamun  
-** Member 2 : Siam
-** Member 3: Ayush
+**Project lead:** Mamun
+
+**Member 2 :** Siam
+
+**Member 3:** Ayush
+
 **Institution:** Tongmyong University, Busan, South Korea
