@@ -1,4 +1,10 @@
-# CLARO V1 — Intelligent Campus Companion
+
+# CLARO  —  Campus Companion Robot
+
+<img width="240" height="320" alt="IMG_4975" src="https://github.com/user-attachments/assets/1e32a0de-d698-4adb-b642-e95bc032f459" />
+<img width="240" height="320" alt="IMG_4976" src="https://github.com/user-attachments/assets/a6f01657-f0c8-4fad-81c3-da19848f1baf" />
+<img width="240" height="320" alt="IMG_4984" src="https://github.com/user-attachments/assets/8f22bb07-5ab1-465d-83cd-8e9b3b556b49" />
+<img width="240" height="320" alt="IMG_4991" src="https://github.com/user-attachments/assets/fa317c7a-fd50-4fbc-b74e-e509c7af9725" />
 
 CLARO is a voice-based campus assistant built with an **ESP32-S3** and a local **Python/FastAPI** backend. It answers campus questions from a local JSON knowledge base and provides animated facial expressions on its TFT display.
 
@@ -17,7 +23,7 @@ CLARO is a voice-based campus assistant built with an **ESP32-S3** and a local *
 ```text
 INMP441 → ESP32-S3 → Wi-Fi → FastAPI backend
                               ├─ Faster-Whisper
-                              ├─ Local JSON Q&A
+                              ├─ sqlite Q&A
                               └─ pyttsx3 + FFmpeg
 MAX98357A + Speaker ← ESP32-S3 ← Response audio
 
